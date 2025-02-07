@@ -124,10 +124,9 @@ jobs:
     needs:
       - check-paths
       - static-analysis
-    if:  always()
+    #if: github.event.pull_request.draft == false && needs.check-paths.outputs.application_files_changed == 'true'
     name: Build & Run Tests w Matrix
     runs-on: ubuntu-latest
-    # if: always()
     strategy:
       matrix:
         test-path: ${{fromJson(needs.check-paths.outputs.matrix) || '["spec/controllers", "spec/requests"]'}}
