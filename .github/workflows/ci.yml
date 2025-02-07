@@ -129,7 +129,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        test-path: ${{fromJson(needs.check-paths.outputs.matrix)}}
+        test-path: ${{fromJson(needs.check-paths.outputs.matrix) || '["spec/controllers", "spec/requests"]'}}
       fail-fast: false
     services:
       postgres:
