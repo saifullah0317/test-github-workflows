@@ -130,26 +130,26 @@ jobs:
     strategy:
       matrix:
         test-path: ${{fromJson(needs.check-paths.outputs.matrix) || '["spec/controllers", "spec/requests"]'}}
-      fail-fast: false
-    services:
-      postgres:
-        image: postgres:12
-        credentials:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres-image-requires-a-password
-          POSTGRES_DB: nayya_insurance_test
-          SECRET_KEY_BASE: 'secret key base example'
-          LOCKBOX_MASTER_KEY: ${{ secrets.LOCKBOX_MASTER_KEY }}
-          ENCRYPTION_SERVICE_SALT: 'example_salt'
-        ports:
-          # will assign a random free host port
-          - 5432/tcp
-        # needed because the postgres container does not provide a healthcheck
-        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
-      redis:
+      # fail-fast: false
+    # services:
+    #   postgres:
+    #     image: postgres:12
+    #     credentials:
+    #       username: ${{ secrets.DOCKERHUB_USERNAME }}
+    #       password: ${{ secrets.DOCKERHUB_TOKEN }}
+    #     env:
+    #       POSTGRES_USER: postgres
+    #       POSTGRES_PASSWORD: postgres-image-requires-a-password
+    #       POSTGRES_DB: nayya_insurance_test
+    #       SECRET_KEY_BASE: 'secret key base example'
+    #       LOCKBOX_MASTER_KEY: ${{ secrets.LOCKBOX_MASTER_KEY }}
+    #       ENCRYPTION_SERVICE_SALT: 'example_salt'
+    #     ports:
+    #       # will assign a random free host port
+    #       - 5432/tcp
+    #     # needed because the postgres container does not provide a healthcheck
+    #     options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+    #   redis:
         image: redis
         # Set health checks to wait until redis has started
         options: >-
