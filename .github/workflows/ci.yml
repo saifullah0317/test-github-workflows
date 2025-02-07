@@ -124,11 +124,7 @@ jobs:
     needs:
       - check-paths
       - static-analysis
-    if:  |
-      github.event_name == 'workflow_dispatch' || 
-      (github.event_name != 'workflow_dispatch' && 
-      github.event.pull_request.draft == false && 
-      needs.check-paths.outputs.application_files_changed == 'true')
+    if:  always()
     name: Build & Run Tests w Matrix
     runs-on: ubuntu-latest
     # if: always()
