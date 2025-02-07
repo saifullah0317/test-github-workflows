@@ -1,0 +1,360 @@
+name: Static Analysis + Tests (parallel)
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+jobs:
+  check-paths:
+    # Only run tests if application files have changed:
+    name: Check paths
+    outputs:
+      application_files_changed: ${{ steps.application_files_changed.outputs.application_any_modified }}
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 100
+
+      - id: application_files_changed
+        uses: tj-actions/changed-files@v44
+        with:
+          files_yaml: |
+            application:
+            - app/**
+            - lib/**
+            - bin/**
+            - config/**
+            - db/**
+            - public/**
+            - spec/**
+            - sorbet/**
+            - .rspec
+            - .ruby-version
+            - babel.config.js
+            - config.ru
+            - jest.config.js
+            - package.json
+            - postcss.config.js
+            - Rakefile
+            - tsconfig.json
+            - yarn.lock
+            - Gemfile
+            - Gemfile.lock
+            - .yarn/**
+            - .yarnrc.yml
+            - .github/workflows/static-analysis-and-tests.yml
+            - .nvmrc
+      - id: set-matrix
+        run: |
+          DATA=$(ls -d spec/*/ | jq --raw-input . | jq --slurp . | jq 'del(.[] | select(. == "spec/controllers/"))' | jq 'del(.[] | select(. == "spec/requests/"))' | jq 'del(.[] | select(. == "spec/factories/"))' | jq 'del(.[] | select(. == "spec/cassettes/"))' | jq 'del(.[] | select(. == "spec/data/"))' | jq 'del(.[] | select(. == "spec/factories/"))' | jq 'del(.[] | select(. == "spec/fixtures/"))' | jq '_nwise(4)' | jq 'join(",")' | jq 'gsub(","; " ")' | jq --slurp | jq '.+=["spec/controllers"]' | jq '.+=["spec/requests"]' | jq -c .)
+          echo $DATA
+          echo "matrix=$DATA" >> "$GITHUB_OUTPUT"
+
+  static-analysis:
+    # Adapted from: https://docs.knapsackpro.com/2019/how-to-run-rspec-on-github-actions-for-ruby-on-rails-app-using-parallel-jobs
+    needs:
+      - check-paths
+    if:  |
+      github.event_name == 'workflow_dispatch' || 
+      (github.event_name != 'workflow_dispatch' && 
+      github.event.pull_request.draft == false && 
+      needs.check-paths.outputs.application_files_changed == 'true')
+    name: Static Type Checking
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+     
+      # required to compile pg ruby gem
+      - name: Install PostgreSQL client
+        run: sudo apt-get install -y libpq-dev libyaml-dev ca-certificates shared-mime-info libpq-dev wkhtmltopdf libjpeg62 libpng16-16 libxrender1 libfontconfig1 libxext6
+
+      # required for ID card image generation
+      - name: Install Imagemagick
+        run: sudo apt-get install -y libmagick++-dev inkscape gsfonts imagemagick
+        
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: 3.2.3
+          bundler-cache: true
+
+      - name: Run static type checks
+        run: |
+          bundle exec srb tc . --ignore=/vendor
+          echo "static-analysis/Run static type checks"
+        env:
+          CI: true
+          SECRET_KEY_BASE: example_secret_key_base
+          ENCRYPTION_SERVICE_SALT: example_salt
+
+      - name: Ensure RBI files for gems exist and up to date
+        run: |
+          bundle exec tapioca gem --verify
+          echo "static-analysis/Ensure RBI files for gems exist and up to date"
+        env:
+          CI: true
+          SECRET_KEY_BASE: example_secret_key_base
+          ENCRYPTION_SERVICE_SALT: example_salt
+
+      - name: Validate Autoloading
+        run: |
+          bundle exec rails zeitwerk:check
+          echo "static-analysis/Validate Autoloading"
+        env:
+          CI: true
+          SECRET_KEY_BASE: example_secret_key_base
+          ENCRYPTION_SERVICE_SALT: example_salt
+          LAUNCHDARKLY_KEY: ${{ secrets.LAUNCHDARKLY_KEY }}
+          RAILS_ENV: test
+
+  run-tests:
+    needs:
+      - check-paths
+      - static-analysis
+    #if: github.event.pull_request.draft == false && needs.check-paths.outputs.application_files_changed == 'true'
+    name: Build & Run Tests w Matrix
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        test-path: ${{fromJson(needs.check-paths.outputs.matrix)}}
+      fail-fast: false
+    services:
+      postgres:
+        image: postgres:12
+        credentials:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres-image-requires-a-password
+          POSTGRES_DB: nayya_insurance_test
+          SECRET_KEY_BASE: 'secret key base example'
+          LOCKBOX_MASTER_KEY: ${{ secrets.LOCKBOX_MASTER_KEY }}
+          ENCRYPTION_SERVICE_SALT: 'example_salt'
+        ports:
+          # will assign a random free host port
+          - 5432/tcp
+        # needed because the postgres container does not provide a healthcheck
+        options: --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+      redis:
+        image: redis
+        # Set health checks to wait until redis has started
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          # Maps port 6379 on service container to the host
+          - 6379:6379
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - uses: webfactory/ssh-agent@v0.5.3
+        with:
+          ssh-private-key: ${{ secrets.SHARED_COMPONENTS_REPO_DEPLOY_KEY }}
+      
+      # required to compile pg ruby gem
+      - name: Install PostgreSQL client
+        run: sudo apt-get install -y libpq-dev libyaml-dev ca-certificates shared-mime-info libpq-dev wkhtmltopdf libjpeg62 libpng16-16 libxrender1 libfontconfig1 libxext6
+
+      # required for ID card image generation
+      - name: Install Imagemagick
+        run: sudo apt-get install -y libmagick++-dev inkscape gsfonts imagemagick
+
+      - name: Set up Ruby
+        # To automatically get bug fixes and new Ruby versions for ruby/setup-ruby,
+        # change this to (see https://github.com/ruby/setup-ruby#versioning):
+        # uses: ruby/setup-ruby@v1
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: 3.2.3
+          bundler-cache: true
+
+      - name: Set up node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Install Yarn
+        run: npm install --global yarn
+
+      - name: Build and setup DB
+        env:
+          # use localhost for the host here because we have specified a container for the job.
+          # If we were running the job on the VM this would be postgres
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres-image-requires-a-password
+          PGPORT: ${{ job.services.postgres.ports[5432] }} # get randomly assigned published port
+          DNA_DATABASE_HOST: ${{ secrets.DNA_DATABASE_HOST }}
+          DNA_DATABASE_USER: ${{ secrets.DNA_DATABASE_USER }}
+          DNA_DATABASE_PASSWORD: ${{ secrets.DNA_DATABASE_PASSWORD }}
+          LAUNCHDARKLY_KEY: ${{ secrets.LAUNCHDARKLY_KEY }}
+          LOCKBOX_MASTER_KEY: ${{ secrets.LOCKBOX_MASTER_KEY }}
+          SECRET_KEY_BASE: 'secret key base example'
+          ENCRYPTION_SERVICE_SALT: 'example_salt'
+          DD_PROFILING_ENABLED: false
+          RAILS_ENV: test
+        run: |
+          bundle exec rails db:create db:environment:set db:migrate
+          bundle exec rails db:schema:cache:dump
+
+      # This replaces the pre-compile step, it's necessary to run the webpack
+      # CLI that is called during React tests (when pre-compile assets has not
+      # been run).  Though this command adds 1-2 minutes of run time, the total
+      # run time is reduced by 2-4 minutes by not running precompile assets.
+      #
+      # Options to speed this up:
+      # - Yarn 2.0 claims 75% faster run times
+      - name: Yarn install
+        env:
+          RAILS_ENV: test
+        run: |
+          yarn install
+          echo "run-tests/Yarn install"
+
+      - name: Run Tests
+        env:
+          AWS_ACCESS_KEY_ID: 'dummy'
+          AWS_DEFAULT_REGION: 'us-east-1'
+          AWS_SECRET_ACCESS_KEY: 'dummy'
+          BRAZE_REST_API_URL: https://braze.com
+          BRAZE_REST_API_KEY: not_api_keyu
+          BRAZE_SDK_URL: not_sdk_url
+          BRAZE_SDK_KEY: not_sdk_key
+          CC_TEST_REPORTER_ID: ${{ secrets.CC_TEST_REPORTER_ID }}
+          DEVISE_JWT_SECRET_KEY: 'example_secrey_key'
+          DNA_DATABASE_HOST: ${{ secrets.DNA_DATABASE_HOST }}
+          DNA_DATABASE_USER: ${{ secrets.DNA_DATABASE_USER }}
+          DNA_DATABASE_PASSWORD: ${{ secrets.DNA_DATABASE_PASSWORD }}
+          ENCRYPTION_SERVICE_SALT: 'example_salt'
+          LAUNCHDARKLY_KEY: ${{ secrets.LAUNCHDARKLY_KEY }}
+          LOCKBOX_MASTER_KEY: ${{ secrets.LOCKBOX_MASTER_KEY }}
+          CUSTOMER_SUCCESS: 'customersuccess@nayya.com'
+          MAMA_NAYYA_GRAPHQL_URL: ${{ secrets.MAMA_NAYYA_GRAPHQL_URL }}
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres-image-requires-a-password
+          PGPORT: ${{ job.services.postgres.ports[5432] }} # get randomly assigned published port
+          RAILS_ENV: test
+          REDIS_URL: redis://localhost:6379
+          SECRET_KEY_BASE: 'secret key base example'
+          DD_PROFILING_ENABLED: false
+        run: |
+          bundle exec rspec ${{ matrix.test-path }}
+          echo "run-tests/Run Tests"
+
+      - name: Generate a unique id
+        if: success() || failure()
+        id: gen-id
+        run: |
+          echo "rand=$(openssl rand -hex 3)" >> "$GITHUB_OUTPUT"
+          echo "run-tests/Generate a unique id"
+
+      - name: Upload Coverage Artifact
+        uses: actions/upload-artifact@v4
+        if: success() || failure()
+        with:
+          name: simplecov-json-${{ steps.gen-id.outputs.rand }}
+          path: coverage/.resultset.json
+          include-hidden-files: true
+
+  upload-coverage:
+    if: success() || failure()
+    needs:
+      - run-tests
+    name: Publish Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: 3.2.3
+          bundler-cache: true
+
+      - name: Set up node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+     
+
+      - name: Download Coverage Artifacts
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{secrets.GITHUB_TOKEN}}
+          workflow_conclusion: ""
+          run_id: ${{github.run_id}}
+          path: coverage
+
+      - name: Collate Coverage Artifact and Publish
+        uses: paambaati/codeclimate-action@v3.0.0
+        env:
+          AWS_ACCESS_KEY_ID: 'dummy'
+          AWS_DEFAULT_REGION: 'us-east-1'
+          AWS_SECRET_ACCESS_KEY: 'dummy'
+          CC_TEST_REPORTER_ID: ${{ secrets.CC_TEST_REPORTER_ID }}
+          DEVISE_JWT_SECRET_KEY: 'example_secrey_key'
+          DNA_DATABASE_HOST: ${{ secrets.DNA_DATABASE_HOST }}
+          DNA_DATABASE_USER: ${{ secrets.DNA_DATABASE_USER }}
+          DNA_DATABASE_PASSWORD: ${{ secrets.DNA_DATABASE_PASSWORD }}
+          ENCRYPTION_SERVICE_SALT: 'example_salt'
+          LAUNCHDARKLY_KEY: ${{ secrets.LAUNCHDARKLY_KEY }}
+          LOCKBOX_MASTER_KEY: ${{ secrets.LOCKBOX_MASTER_KEY }}
+          CUSTOMER_SUCCESS: 'customersuccess@nayya.com'
+          MAMA_NAYYA_GRAPHQL_URL: ${{ secrets.MAMA_NAYYA_GRAPHQL_URL }}
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres-image-requires-a-password
+          PGPORT: ${{ job.services.postgres.ports[5432] }} # get randomly assigned published port
+          RAILS_ENV: test
+          REDIS_URL: redis://localhost:6379
+          SECRET_KEY_BASE: 'secret key base example'
+        with:
+          coverageCommand: bundle exec rake coverage:report
+
+  check-specs:
+    needs:
+      - check-paths
+      - run-tests
+    name: Specs Must Pass
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Fail if specs failed
+        run: |
+          echo "check-specs/Fail if specs failed"
+          result="${{ needs.run-tests.result }}"
+          if [[ "$result" == "failure" || "$result" == "cancelled" || "$result" == "skipped" ]] && [[ "${{ needs.check-paths.outputs.application_files_changed }}" == 'true' ]]; then
+            exit 1
+          else
+            exit 0
+          fi
+
+  # trigger_regression_job:
+  #   needs:
+  #     - check-paths
+  #     - static-analysis
+  #   #if: github.event.pull_request.draft == false && needs.check-paths.outputs.application_files_changed == 'true'
+  #   name: Trigger Main Regression Job
+  #   uses: ./.github/workflows/regression-tests-matrix.yml
+  #   secrets: inherit
