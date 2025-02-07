@@ -128,9 +128,9 @@ jobs:
     name: Build & Run Tests w Matrix
     runs-on: ubuntu-latest
     if: always()
-    # strategy:
-    #   matrix:
-    #     test-path: ${{fromJson(needs.check-paths.outputs.matrix) || '["spec/controllers", "spec/requests"]'}}
+    strategy:
+      matrix:
+        test-path: ${{fromJson(needs.check-paths.outputs.matrix) || '["spec/controllers", "spec/requests"]'}}
       # fail-fast: false
     # services:
     #   postgres:
